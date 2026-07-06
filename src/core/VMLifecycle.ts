@@ -1196,9 +1196,17 @@ export class VMLifecycle {
         runAsUser: process.env.INFINIZATION_QEMU_USER,
         // Honor an explicit sandbox opt-out on start too, so a VM created with the
         // sandbox disabled (VMCreateConfig.disableSandbox) does not silently
-        // re-enable it on the next stop/start. Default (undefined) keeps seccomp ON
-        // — buildQemuCommand enables it unless explicitly disabled here.
-        disableSandbox: config?.disableSandbox === true ? true : undefined
+        // re-enable it on the next stop/start. Also fall back to the
+        // INFINIZATION_DISABLE_SANDBOX env — mirroring the INFINIZATION_QEMU_USER
+        // fallback above — so restart() and host-reboot recovery (which call
+        // start() WITHOUT a config) still disable the sandbox on substrates that
+        // SIGSYS a sandboxed QEMU (rootless/nested containers). Without this the
+        // dev stack's `restartVM` relaunched QEMU sandboxed and died with SIGSYS
+        // even though power-on (startVM) threaded the opt-out. Default keeps
+        // seccomp ON — buildQemuCommand enables it unless disabled here.
+        disableSandbox: config?.disableSandbox === true || process.env.INFINIZATION_DISABLE_SANDBOX === '1'
+          ? true
+          : undefined
       }
 
       // 14. Create and start QEMU process. Serialize the port re-probe + spawn
