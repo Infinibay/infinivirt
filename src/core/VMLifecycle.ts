@@ -1455,11 +1455,27 @@ export class VMLifecycle {
       }
 
       const qmpSocketPath = vmConfig.configuration?.qmpSocketPath
-      const pid = vmConfig.configuration?.qemuPid
+      let pid = vmConfig.configuration?.qemuPid
       const tapDevice = vmConfig.configuration?.tapDeviceName
 
       // Log diagnostic info for debugging graceful shutdown issues
       this.debug.log('info', `Stop attempt - graceful: ${stopConfig.graceful}, qmpSocketPath: ${qmpSocketPath ?? 'NULL'}, pid: ${pid ?? 'NULL'}`)
+
+      // Orphan-recovery: if the DB lost the PID (a backend restart between the QEMU
+      // spawn and the qemuPid persist, a crash, or manual DB edits) a -daemonize'd
+      // QEMU can still be running — serving SPICE, holding the TAP/disk. With no PID
+      // every branch below no-ops and stop() falsely reports success, ORPHANING the
+      // live process; and the delete path then removes the pidfile so the
+      // pidfile-based HealthMonitor reaper can no longer see it either. Recover the
+      // real PID from the deterministic pidfile (fail-closed /proc identity guard —
+      // a recycled/foreign PID is never adopted) so the reap below actually happens.
+      if (!pid || !this.isProcessAlive(pid)) {
+        const recovered = this.recoverStalePidFromPidfile(vmConfig.internalName)
+        if (recovered !== null) {
+          this.debug.log('warn', `VM ${vmId}: DB qemuPid=${pid ?? 'NULL'} unusable but a live QEMU (PID ${recovered}) was recovered from its pidfile — stopping it instead of orphaning it`)
+          pid = recovered
+        }
+      }
 
       if (stopConfig.graceful && !qmpSocketPath) {
         this.debug.log('warn', `VM ${vmId}: No QMP socket path in DB - graceful shutdown will not be attempted`)
@@ -1714,6 +1730,18 @@ export class VMLifecycle {
       if (vmConfig.status === 'running') {
         this.debug.log(`VM ${vmId} is running, stopping first`)
         await this.stop(vmId, { graceful: false, timeout: 5000, force: true })
+      } else {
+        // stop() only runs for status==='running'. But a VM parked in 'off'/'error'/
+        // 'installing' (e.g. an install-loop the tracker marked 'error', or a state
+        // lost on a backend restart) can still have a live -daemonize'd QEMU serving
+        // SPICE. Deleting it must reap that orphan too, so recover it from the pidfile
+        // and force-kill (identity-checked, fail-closed) rather than leaving it running
+        // after the DB record and disk are gone.
+        const orphanPid = this.recoverStalePidFromPidfile(vmConfig.internalName)
+        if (orphanPid !== null) {
+          this.debug.log('warn', `VM ${vmId}: status='${vmConfig.status}' (not running) but a live QEMU (PID ${orphanPid}) was found via its pidfile during delete — force-killing the orphan`)
+          await this.forceKillProcess(orphanPid, vmConfig.internalName)
+        }
       }
 
       const tapDevice = vmConfig.configuration?.tapDeviceName
@@ -3023,6 +3051,44 @@ export class VMLifecycle {
    */
   private async waitForProcessExit (pid: number, timeout: number): Promise<boolean> {
     return sharedWaitForProcessExit(pid, timeout, PROCESS_EXIT_POLL_INTERVAL)
+  }
+
+  /**
+   * Recover a still-running VM's QEMU PID from its on-disk pidfile when the DB copy
+   * (qemuPid) was lost — e.g. a backend restart between the QEMU spawn and the
+   * qemuPid persist, a crash, or a manual DB edit. Reads {pidfileDir}/{internalName}.pid
+   * and adopts the PID ONLY if it is alive AND /proc confirms it is this VM's
+   * qemu-system (internalName token), mirroring the daemonized-adopt guard used at
+   * start(). Fails SAFE: a missing/unparseable pidfile, a dead PID, or a
+   * recycled/foreign PID all return null, so the caller treats the VM as stopped
+   * rather than signalling an unrelated process.
+   */
+  private recoverStalePidFromPidfile (internalName: string): number | null {
+    const pidFilePath = path.join(this.pidfileDir, `${internalName}.pid`)
+    let content: string
+    try {
+      content = fs.readFileSync(pidFilePath, 'utf8').trim()
+    } catch {
+      // No pidfile on disk → the VM is genuinely stopped. Correct no-op.
+      return null
+    }
+    const pid = parseInt(content, 10)
+    if (isNaN(pid) || pid <= 0) {
+      this.debug.log('warn', `Pidfile ${pidFilePath} did not contain a valid PID ("${content}") — not recovering`)
+      return null
+    }
+    if (!this.isProcessAlive(pid)) {
+      // Stale pidfile pointing at a dead PID — nothing to stop.
+      return null
+    }
+    // Fail-closed identity guard: only adopt a live PID whose /proc cmdline is this
+    // VM's qemu-system. A recycled PID (now an unrelated host process) or a different
+    // VM's QEMU is rejected — we must never signal it.
+    if (!this.pidBelongsToVM(pid, internalName)) {
+      this.debug.log('warn', `Pidfile ${pidFilePath} PID ${pid} is alive but not confirmed to be this VM's QEMU — not recovering (PID-reuse guard)`)
+      return null
+    }
+    return pid
   }
 
   /**
