@@ -912,19 +912,10 @@ export class VMLifecycle {
       const qmpSocketPath = path.join(this.qmpSocketDir, `${vmConfig.internalName}.sock`)
       const pidFilePath = path.join(this.pidfileDir, `${vmConfig.internalName}.pid`)
 
-      // 5a. Clean up orphan QMP socket if exists (from crashed QEMU or unclean shutdown)
-      // This prevents QEMU from failing to start or connection issues
-      if (fs.existsSync(qmpSocketPath)) {
-        this.debug.log('warn', `Found existing QMP socket: ${qmpSocketPath}, removing orphan socket`)
-        try {
-          fs.unlinkSync(qmpSocketPath)
-          this.debug.log('info', `Removed orphan QMP socket: ${qmpSocketPath}`)
-        } catch (unlinkError) {
-          this.debug.log('error', `Failed to remove orphan QMP socket: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`)
-        }
-      }
-
-      // 5b. Clean up orphan PID file if exists (from crashed QEMU or unclean shutdown)
+      // 5a. Orphan PID-file guard FIRST — BEFORE touching the QMP socket. If a live
+      // QEMU still owns this VM's pidfile we refuse to start WITHOUT deleting its QMP
+      // socket. The old order removed the socket first, which left a still-alive QEMU
+      // unreachable via QMP (impossible to stop gracefully → a permanent orphan).
       // QEMU uses flock() on the PID file, so if a previous process crashed, the lock
       // is released but the file may remain. If a process is still alive, we should not
       // attempt to start a duplicate VM.
@@ -971,6 +962,20 @@ export class VMLifecycle {
           } catch (unlinkError) {
             this.debug.log('error', `Failed to remove orphan PID file: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`)
           }
+        }
+      }
+
+      // 5b. Orphan QMP socket cleanup — ONLY now that the PID-file guard above has
+      // confirmed no live QEMU owns this VM. A stale socket left by a crashed/unclean
+      // QEMU would make the new QEMU fail to bind; removing it here (after the guard)
+      // guarantees we never delete the QMP socket of a still-running QEMU.
+      if (fs.existsSync(qmpSocketPath)) {
+        this.debug.log('warn', `Found existing QMP socket: ${qmpSocketPath}, removing orphan socket`)
+        try {
+          fs.unlinkSync(qmpSocketPath)
+          this.debug.log('info', `Removed orphan QMP socket: ${qmpSocketPath}`)
+        } catch (unlinkError) {
+          this.debug.log('error', `Failed to remove orphan QMP socket: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`)
         }
       }
 

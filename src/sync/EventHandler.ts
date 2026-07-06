@@ -777,17 +777,32 @@ export class EventHandler extends EventEmitter {
   1. Guest OS is taking longer than expected to shutdown
   2. Guest OS does not support ACPI powerdown
   3. QEMU process is hung (requires manual investigation)`)
-        // Note: We do NOT force-kill here. Guest-initiated shutdowns should complete
-        // naturally, and hung processes warrant investigation rather than force-kill.
-        // VMLifecycle.stop() handles force-kill for host-initiated shutdowns with timeout.
+        // The guest failed to complete the ACPI shutdown but QEMU is STILL RUNNING.
+        // We must NOT clear the volatile config / detach TAP+firewall / leave the row
+        // 'off' (handleTerminalShutdown flipped it optimistically before this wait):
+        // doing so ORPHANS a live QEMU — the management plane reports 'off' while the
+        // process keeps serving SPICE and holding the disk, and the next start() would
+        // then delete its live QMP socket, leaving it permanently unstoppable via QMP.
+        // Reconcile the row back to 'running' and SKIP cleanup so the VM stays tracked
+        // and manageable. We still do NOT force-kill here (a slow guest may yet finish,
+        // and a genuinely hung one warrants investigation); an explicit stop() with
+        // force is the supported way to terminate it. If QEMU does exit later, the QMP
+        // disconnect + HealthMonitor reconciliation flips the row to 'off' as for a crash.
+        try {
+          await this.stateSync.updateStatusDirect(vmId, 'running')
+          this.debug.log('warn', `VM ${vmId}: reverted row to 'running' and skipped resource cleanup (QEMU PID ${pid} still alive) to avoid orphaning it`)
+        } catch (revertErr) {
+          this.debug.log('error', `VM ${vmId}: failed to revert status to 'running' after non-exit: ${revertErr instanceof Error ? revertErr.message : String(revertErr)}`)
+        }
+        return
       }
     } else {
       this.debug.log('debug', `No PID available for VM ${vmId}, cannot monitor process exit`)
     }
 
-    // Perform resource cleanup for guest-initiated shutdowns
-    // This mirrors the cleanup logic in VMLifecycle.stop() to ensure
-    // consistent state regardless of shutdown source (host vs guest)
+    // Perform resource cleanup — reached only when QEMU actually exited (or when no
+    // PID was known to monitor). Mirrors the cleanup logic in VMLifecycle.stop() to
+    // ensure consistent state regardless of shutdown source (host vs guest).
     await this.cleanupVMResources(vmId, tapDeviceName)
   }
 
