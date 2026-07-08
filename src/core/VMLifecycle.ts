@@ -1642,12 +1642,24 @@ export class VMLifecycle {
       //    is delayed, HealthMonitor won't find a PID to check
       // EventHandler is detached above, so no QMP events will trigger status changes.
       //
-      // onlyIfNotIn:['error'] closes the InstallResetTracker race: that detector
+      // onlyIfNotIn closes two races. (1) InstallResetTracker: that detector
       // force-stops a boot/install-looping VM (calling into this stop()) and then
-      // marks the row 'error'. This stop()'s own 'off' write can otherwise land
-      // AFTER that 'error' and silently downgrade it back to 'off', hiding the
-      // failure. A VM already parked in terminal 'error' stays 'error'.
-      await this.prisma.updateMachineStatus(vmId, 'off', { onlyIfNotIn: ['error'] })
+      // marks the row 'error'; this stop()'s own 'off' write can otherwise land
+      // AFTER that 'error' and silently downgrade it, hiding the failure. (2) The
+      // backend status-as-lock markers (audit C2/C3): a stop() that races a
+      // cross-node migration ('moving'), a delete ('deleting'), a pool rebuild
+      // ('rebuilding'), or a disk op (backing_up/restoring/snapshotting/capturing)
+      // must NOT reset the row to 'off' — doing so silently RELEASES that lock,
+      // letting a concurrent power-on/reclaim corrupt the disk or split-brain the
+      // VM. A VM parked in any of these claim states keeps it; only genuine QEMU
+      // power states fall through to 'off'.
+      await this.prisma.updateMachineStatus(vmId, 'off', {
+        onlyIfNotIn: [
+          'error',
+          'moving', 'deleting', 'rebuilding',
+          'backing_up', 'restoring', 'snapshotting', 'capturing'
+        ]
+      })
 
       // Clear volatile machine configuration (qmpSocketPath, qemuPid)
       // Note: tapDeviceName is preserved for persistent TAP device reuse on restart
