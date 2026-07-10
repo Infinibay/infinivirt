@@ -555,6 +555,18 @@ export class HealthMonitor extends EventEmitter {
           continue
         }
 
+        // VM is migrating between nodes ('moving'): the master's migration flow is
+        // the sole writer of its status/nodeId, and during a cross-node move its
+        // QEMU may legitimately run on the destination while the row still names the
+        // source. Never reap it here — resolving cross-node ownership is the
+        // master's job. (findMachineByInternalName deliberately surfaces moving VMs
+        // regardless of local node ownership so this guard can see them; a strictly
+        // node-scoped read would have returned null above and authorized a kill.)
+        if (vmRecord.status === 'moving') {
+          this.debug.log(`Skipping ${internalName} (PID ${pid}): VM is migrating (status 'moving'), owned by the master migration flow`)
+          continue
+        }
+
         // VM is in a transient state (still booting / rebuilding / powering off):
         // the startup reconcile pass owns these. Acting here would reap a VM that
         // is legitimately mid-start. Skip and let reconcileTransientStates resolve it.

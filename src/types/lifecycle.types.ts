@@ -8,6 +8,7 @@
 import { UnattendedInstallConfig } from './unattended.types'
 import { FirewallDefaultAction } from './firewall.types'
 import type { PrismaClientLike, InfinizationDatabase } from '../db/PrismaAdapter'
+import type { OverlaySelfIdentity } from './overlay.types'
 
 // =============================================================================
 // Configuration Types
@@ -733,6 +734,16 @@ export interface InfinizationConfig {
    * Defaults to that env var (`'degrade'` ⇒ degrade), else `'fail'`.
    */
   bridgeConntrackMode?: 'fail' | 'degrade'
+  /**
+   * This host's department-overlay identity (07-networking.md §1). Set by the
+   * node agent on an overlay-capable compute node — its VTEP address, the path to
+   * its WireGuard private key (which never leaves the host), and the WG listen
+   * port. When present, `ensureSegment`/`setPeers`/`destroySegment` can realize a
+   * node-spanning L2 segment locally; when absent those verbs throw (the host is
+   * not overlay-capable). Master-pushed per-segment data (vni/peers/gatewayCidr)
+   * arrives as call arguments, never from the DB.
+   */
+  overlay?: OverlaySelfIdentity
 }
 
 /**

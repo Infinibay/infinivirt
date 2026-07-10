@@ -522,6 +522,56 @@ export class NftablesService {
   }
 
   /**
+   * Belt-and-suspenders underlay ingress filter for the department overlay
+   * (07-networking.md §2, ADR-N4). Installs an ISOLATED `inet` table whose input
+   * chain drops VXLAN (UDP/4789) and WireGuard (UDP/<wgPort>) packets from any
+   * source that is NOT an enrolled peer, while `policy accept` leaves ALL other
+   * traffic (SSH, the API, everything) untouched — so a misconfiguration can never
+   * lock the host out. WireGuard is the PRIMARY authentication boundary; this is
+   * defense-in-depth for a shared/dedicated underlay.
+   *
+   * Idempotent: the whole table is atomically replaced each call (add→delete→declare
+   * in one `nft -f -` transaction), so the peer set exactly matches `peerHostIps`.
+   * Lives in its own table, entirely separate from the bridge-family per-VM firewall,
+   * so it cannot disturb VM filtering. Invalid IPs/ports are dropped defensively.
+   */
+  async ensureUnderlayIngressFilter (peerHostIps: string[], ports: number[]): Promise<void> {
+    const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+    const validIp = (ip: string): boolean => {
+      const m = IPV4.exec(ip)
+      return m !== null && m.slice(1, 5).every(o => Number(o) >= 0 && Number(o) <= 255)
+    }
+    const ips = [...new Set(peerHostIps.filter(validIp))]
+    const portSet = [...new Set(ports.filter(p => Number.isInteger(p) && p > 0 && p < 65536))]
+    if (portSet.length === 0) return
+
+    const table = 'inet infinibay_overlay'
+    // NO peers → REMOVE the table entirely rather than install a blanket `drop` that
+    // would blackhole ALL VXLAN/WireGuard input node-wide (H5). `add`+`delete` in one
+    // transaction is a safe idempotent "ensure absent".
+    if (ips.length === 0) {
+      await this.execFile(`add table ${table}\ndelete table ${table}`)
+      return
+    }
+
+    const portList = portSet.join(', ')
+    // add→delete→re-declare in ONE atomic transaction = idempotent full replace.
+    const ruleset = [
+      `add table ${table}`,
+      `delete table ${table}`,
+      `table ${table} {`,
+      `  set peers { type ipv4_addr; elements = { ${ips.join(', ')} } }`,
+      `  chain underlay_ingress {`,
+      '    type filter hook input priority -10; policy accept;',
+      `    udp dport { ${portList} } ip saddr @peers accept`,
+      `    udp dport { ${portList} } drop`,
+      '  }',
+      '}'
+    ].join('\n')
+    await this.execFile(ruleset)
+  }
+
+  /**
    * Removes a VM's firewall chain and all its rules.
    * Also removes jump rules from the base forward chain.
    *

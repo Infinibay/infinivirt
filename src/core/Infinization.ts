@@ -54,8 +54,10 @@ import { PrismaAdapter, type InfinizationDatabase } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { HealthMonitor } from '../sync/HealthMonitor'
 import { NftablesService } from '../network/NftablesService'
+import { OverlayManager } from '../network/OverlayManager'
 import { CgroupsManager } from '../system/CgroupsManager'
 import { Debugger } from '../utils/debug'
+import type { OverlayPeer, OverlaySegmentSpec } from '../types/overlay.types'
 import {
   InfinizationConfig,
   VMCreateConfig,
@@ -92,6 +94,7 @@ export class Infinization {
   private eventHandler!: EventHandler
   private healthMonitor!: HealthMonitor
   private nftables!: NftablesService
+  private overlay!: OverlayManager
   private cgroupsManager!: CgroupsManager
   private eventManager?: EventManagerLike
   private activeVMs: Map<string, ActiveVMResources> = new Map()
@@ -224,6 +227,14 @@ export class Infinization {
       })
       await this.nftables.initialize()
       this.debug.log('Nftables infrastructure initialized')
+
+      // Department L2 overlay realizer (07-networking.md §1). No async init: a pure
+      // command-executor over `ip`/`wg`/`bridge`. `config.overlay` (this node's VTEP
+      // + WireGuard key/port) is present only on an overlay-capable host; when absent
+      // the overlay verbs throw rather than realize a half-built segment. Given the
+      // nftables service so it can install the optional underlay ingress filter
+      // (opt-in). Master-pushed per-segment data arrives as call arguments.
+      this.overlay = new OverlayManager(this.config.overlay, undefined, undefined, this.nftables)
 
       // Reconcile VMs stuck in transient states (starting/rebuilding/powering_off)
       // BEFORE the health monitor begins scanning. Otherwise the very first orphan
@@ -417,6 +428,47 @@ export class Infinization {
 
       return result
     })
+  }
+
+  // ===========================================================================
+  // Department L2 overlay (07-networking.md §1) — OverlayRPC verbs.
+  // These are per-node/per-department, NOT per-VM: the master computes each
+  // department's segment + peer set and pushes it here (agents are told, they
+  // don't read overlay rows from the DB). They serialize per-department inside
+  // OverlayManager, so they take no vmLock.
+  // ===========================================================================
+
+  /**
+   * Idempotently realize a department's node-spanning L2 segment on THIS host:
+   * the `infinibr-<shortId>` bridge, the node-global `infiwg` WireGuard mesh, the
+   * per-department `infivx-<shortId>` VXLAN netdev enslaved to that bridge, the
+   * head-end-replication FDB, and — only on the gateway-owner node — the gateway
+   * IP. All per-segment data (vni/mtu/peers/gatewayCidr) is master-pushed. Throws
+   * on a host with no overlay identity (`InfinizationConfig.overlay`).
+   */
+  async ensureSegment (spec: OverlaySegmentSpec): Promise<void> {
+    this.ensureInitialized()
+    return this.overlay.ensureSegment(spec)
+  }
+
+  /**
+   * Update a department's WireGuard peer set + FDB on this node (membership
+   * fan-out when a node joins/leaves the department's mesh). The bridge name
+   * resolves the department's VXLAN device deterministically.
+   */
+  async setPeers (deptId: string, bridgeName: string, peers: OverlayPeer[]): Promise<void> {
+    this.ensureInitialized()
+    return this.overlay.setPeers(deptId, bridgeName, peers)
+  }
+
+  /**
+   * Remove this node's per-department VXLAN netdev when it no longer hosts any VM
+   * of the department. Leaves the shared bridge (backend-owned) and node-global
+   * WireGuard peers intact. Idempotent.
+   */
+  async destroySegment (deptId: string, bridgeName: string): Promise<void> {
+    this.ensureInitialized()
+    return this.overlay.destroySegment(deptId, bridgeName)
   }
 
   /**

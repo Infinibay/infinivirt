@@ -20,6 +20,7 @@ export { MacAddressGenerator } from './network/MacAddressGenerator'
 export { NftablesService } from './network/NftablesService'
 export { FirewallRuleTranslator, FirewallTranslationError } from './network/FirewallRuleTranslator'
 export { DepartmentNatService } from './network/DepartmentNatService'
+export { OverlayManager } from './network/OverlayManager'
 
 // Storage classes
 export { QemuImgService } from './storage/QemuImgService'
@@ -101,6 +102,18 @@ export {
   MAX_TAP_NAME_LENGTH,
   TAP_NAME_PREFIX
 } from './types/network.types'
+
+// Types - Department L2 overlay (07-networking.md §1)
+export {
+  OVERLAY_VXLAN_PREFIX,
+  OVERLAY_WG_INTERFACE,
+  VXLAN_DSTPORT
+} from './types/overlay.types'
+export type {
+  OverlayPeer,
+  OverlaySelfIdentity,
+  OverlaySegmentSpec
+} from './types/overlay.types'
 
 // Types - Firewall
 export {

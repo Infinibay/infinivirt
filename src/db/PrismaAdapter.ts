@@ -49,6 +49,7 @@ interface PrismaMachineRecord {
   id: string
   status: string
   name?: string
+  nodeId?: string | null
   internalName?: string
   os?: string
   cpuCores?: number
@@ -376,13 +377,22 @@ export class PrismaAdapter implements DatabaseAdapter {
     this.debug.log(`findMachineByInternalName: ${internalName}`)
 
     try {
+      // Node-scoped: a LOCAL pidfile maps to one of THIS node's VMs. A record owned
+      // by another node must read as "not mine" so the orphan scanner does not reap a
+      // process the local DB view cannot account for — EXCEPT a VM that is
+      // mid-migration (status 'moving'). During a cross-node move the row's `nodeId`
+      // still points at the source while the QEMU may already exist on the
+      // destination, so a strictly node-scoped read returns null and would authorize a
+      // kill of a legitimately-migrating VM. Surfacing moving VMs regardless of owner
+      // lets checkOrphanProcesses recognise and skip them (they are owned by the
+      // master migration flow); killOrphan still verifies /proc identity, so nothing
+      // else widens. We key on `status:'moving'` (the migration flow's real marker),
+      // NOT `migrationJobId` (never written). Single-host (no nodeId) is unchanged.
+      const where = this.nodeId
+        ? { internalName, OR: [{ nodeId: this.nodeId }, { status: 'moving' }] }
+        : { internalName }
       const machine = await this.prisma.machine.findFirst({
-        // Node-scoped: a LOCAL pidfile maps to one of THIS node's VMs. A record
-        // owned by another node must read as "not mine" so the orphan scanner
-        // does not reap a process the local DB view cannot account for.
-        // (Migration-era caveat: Phase 4 must consult the migration marker
-        // before this null can authorize a kill on an incoming/outgoing VM.)
-        where: { internalName, ...this.nodeScope() },
+        where,
         include: {
           configuration: {
             select: RUNNING_VM_CONFIG_SELECT
@@ -395,13 +405,18 @@ export class PrismaAdapter implements DatabaseAdapter {
         return null
       }
 
+      // A FOREIGN row can only have surfaced because it is 'moving' (the OR branch).
+      // Do not hand back another node's qemuPid/socket paths — the orphan scanner
+      // only needs `status` to skip it, and over the /cluster/db RPC this would be
+      // cross-node info disclosure. Null the config for rows this node does not own.
+      const foreign = this.nodeId != null && machine.nodeId != null && machine.nodeId !== this.nodeId
       return {
         id: machine.id,
         status: machine.status,
         // We queried by this exact internalName, so it is non-null here; fall
         // back to the queried value if Prisma did not echo the column.
         internalName: machine.internalName ?? internalName,
-        MachineConfiguration: machine.configuration
+        MachineConfiguration: (!foreign && machine.configuration)
           ? {
               qemuPid: machine.configuration.qemuPid,
               tapDeviceName: machine.configuration.tapDeviceName,

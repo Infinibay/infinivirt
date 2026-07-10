@@ -605,11 +605,19 @@ describe('PrismaAdapter node scoping (G0 — node-scoped enumeration reads)', ()
     expect(captured.findMany[0]).toEqual({ status: { in: ['starting', 'off'] }, nodeId: 'node-A' })
   })
 
-  it('node-scoped adapter filters findMachineByInternalName by nodeId (orphan map stays local)', async () => {
+  it('node-scoped findMachineByInternalName matches this node OR any migrating VM (orphan map stays local but never reaps an in-flight move)', async () => {
     const { prisma, captured } = makeWhereCapturingPrisma([ROW])
     const adapter = new PrismaAdapter(prisma, 'node-A')
     await adapter.findMachineByInternalName('vm-one')
-    expect(captured.findFirst[0]).toEqual({ internalName: 'vm-one', nodeId: 'node-A' })
+    // A LOCAL pidfile maps to one of THIS node's VMs — EXCEPT a VM that is
+    // mid-migration ('moving', migrationJobId set), whose nodeId may still name the
+    // source while its QEMU already runs on the destination. Surfacing moving VMs
+    // regardless of owner lets HealthMonitor.checkOrphanProcesses recognise and skip
+    // them instead of killing a legitimately-migrating process.
+    expect(captured.findFirst[0]).toEqual({
+      internalName: 'vm-one',
+      OR: [{ nodeId: 'node-A' }, { status: 'moving' }]
+    })
   })
 
   it("a node-scoped adapter's running-VM query carries nodeId so another node's rows are excluded (cross-kill prevented)", async () => {
