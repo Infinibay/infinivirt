@@ -1,6 +1,6 @@
 {
   "name": "@infinibay/infinization",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Custom virtualization solution for managing QEMU VMs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

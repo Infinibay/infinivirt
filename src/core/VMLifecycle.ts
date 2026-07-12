@@ -2791,6 +2791,7 @@ export class VMLifecycle {
     builder
       .enableKvm()
       .setMachine(effectiveMachineType)
+      .setRtc('utc')
       .setCpu(effectiveCpuModel, config.cpuCores)
       .setMemory(config.ramGB)
 

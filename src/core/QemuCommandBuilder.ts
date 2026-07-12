@@ -142,6 +142,20 @@ export class QemuCommandBuilder {
   }
 
   /**
+   * Set the emulated RTC base. Default 'utc' — QEMU's own default is already utc,
+   * but we set it EXPLICITLY so the guest's hardware clock is UTC regardless of
+   * host/QEMU defaults. Guests must be configured to read the RTC as UTC (Linux:
+   * kickstart `timezone --utc` / Debian+Ubuntu default; Windows: registry
+   * RealTimeIsUniversal=1). A skewed guest clock silently breaks the HMAC-signed
+   * command channel (fail-closed on the agent's freshness window).
+   * @param base - 'utc' (default) or 'localtime'
+   */
+  setRtc (base: 'utc' | 'localtime' = 'utc'): this {
+    this.args.push('-rtc', `base=${base}`)
+    return this
+  }
+
+  /**
    * Set CPU model and topology
    * @param model - CPU model (e.g., 'host')
    * @param cores - Number of CPU cores
