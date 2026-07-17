@@ -3041,11 +3041,16 @@ export class VMLifecycle {
       }
     }
 
-    // Audio device (Intel HDA)
+    // Audio device (Intel HDA over the SPICE audiodev). SKIP for infinigpu VMs: the
+    // vfio-user QEMU is built without SPICE and GPU VMs have no SPICE server, so
+    // `-audiodev spice` fails to parse ("driver does not accept value 'spice'") and
+    // aborts startup. GPU-VM audio is a future infiniPixel-side feature.
     const enableAudio = config.enableAudio ?? qemuConfig?.enableAudio ?? false
-    if (enableAudio) {
+    if (enableAudio && !config.gpu?.socketPath) {
       builder.addAudioDevice()
       this.debug.log('info', 'Intel HDA audio device enabled')
+    } else if (enableAudio) {
+      this.debug.log('info', 'infinigpu VM: skipping SPICE audio device (vfio-user QEMU has no SPICE server)')
     }
 
     // USB tablet for absolute mouse positioning
