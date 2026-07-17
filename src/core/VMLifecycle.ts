@@ -1157,7 +1157,11 @@ export class VMLifecycle {
         displayPort,
         displayPassword,
         displayAddr,
-        gpuPciAddress: vmConfig.gpuPciAddress ?? undefined
+        gpuPciAddress: vmConfig.gpuPciAddress ?? undefined,
+        // Re-attach the infinigpu virtual GPU on start. The config above is
+        // DB-derived and has no gpu field, so the backend threads department
+        // policy via VMStartConfig.gpu on every start (mirrors disableSandbox).
+        gpu: config?.gpu
         // Note: ISO not included for start - VM should boot from disk
       }
 
@@ -2869,7 +2873,7 @@ export class VMLifecycle {
     // FAIL-CLOSED: never expose an unauthenticated console off-host. A non-loopback
     // bind with no password would have been an open remote desktop for any host
     // that can route to the hypervisor.
-    if (!isLoopbackAddr(effectiveDisplayAddr) && !hasDisplayPassword) {
+    if (!config.gpu?.socketPath && !isLoopbackAddr(effectiveDisplayAddr) && !hasDisplayPassword) {
       throw new LifecycleError(
         LifecycleErrorCode.INVALID_CONFIG,
         `Refusing to start an unauthenticated ${config.displayType} display on non-loopback address '${effectiveDisplayAddr}'. Set a displayPassword or bind to loopback.`,
@@ -2877,7 +2881,11 @@ export class VMLifecycle {
       )
     }
 
-    if (config.displayType === 'spice') {
+    if (config.gpu?.socketPath) {
+      // infinigpu is the guest's SOLE display (addInfinigpuDevice forces -vga none);
+      // skip the SPICE/VNC console entirely — the remote display is infiniPixel.
+      this.debug.log('infinigpu virtual GPU enabled; skipping SPICE/VNC console device')
+    } else if (config.displayType === 'spice') {
       const spiceConfig = new SpiceConfig({
         port: effectiveDisplayPort,
         addr: effectiveDisplayAddr,
@@ -2969,6 +2977,18 @@ export class VMLifecycle {
         }
       }
       builder.addGpuPassthrough(config.gpuPciAddress, config.gpuRomfile)
+    }
+
+    // infinigpu virtual GPU (opt-in). Becomes the guest's SOLE display device —
+    // addInfinigpuDevice forces -vga none — so the SPICE/VNC console above is
+    // skipped when this is set. The socket is served by the per-VM
+    // InfinigpuDeviceServer the facade started before QEMU connects.
+    if (config.gpu?.socketPath) {
+      builder.addInfinigpuDevice({
+        socketPath: config.gpu.socketPath,
+        guestRamBytes: config.ramGB * 1024 ** 3
+      })
+      this.debug.log(`infinigpu virtual GPU attached (socket ${config.gpu.socketPath})`)
     }
 
     // ===========================================================================

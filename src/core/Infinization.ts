@@ -47,6 +47,8 @@
  */
 
 import { VMLifecycle } from './VMLifecycle'
+import { InfinigpuDeviceServer } from './InfinigpuDeviceServer'
+import * as path from 'path'
 import { QMPClient } from './QMPClient'
 import { KeyedMutex } from '../utils/KeyedMutex'
 import { GuestAgentClient } from './GuestAgentClient'
@@ -61,6 +63,7 @@ import type { OverlayPeer, OverlaySegmentSpec } from '../types/overlay.types'
 import {
   InfinizationConfig,
   VMCreateConfig,
+  InfinigpuVmOptions,
   VMCreateResult,
   VMStartConfig,
   VMStopConfig,
@@ -98,6 +101,10 @@ export class Infinization {
   private cgroupsManager!: CgroupsManager
   private eventManager?: EventManagerLike
   private activeVMs: Map<string, ActiveVMResources> = new Map()
+  // Per-VM infinigpu vfio-user device servers (one per GPU VM). Lives on the
+  // singleton facade because VMLifecycle is rebuilt per operation; reaped on
+  // stop / destroy / crash.
+  private infinigpuServers: Map<string, InfinigpuDeviceServer> = new Map()
   private initialized: boolean = false
   private externalPrisma: boolean = false
 
@@ -201,6 +208,9 @@ export class Infinization {
         onCrashDetected: async (vmId: string) => {
           this.debug.log(`Crash detected for VM: ${vmId}`)
           this.activeVMs.delete(vmId)
+          // Reap the infinigpu device server too, or a crashed GPU VM leaks the
+          // host process + its broker admission ticket.
+          await this.reapInfinigpuServer(vmId)
           // Emit crash event to backend
           if (this.eventManager?.emitCRUD) {
             this.eventManager.emitCRUD('machines', 'crash', vmId)
@@ -336,8 +346,20 @@ export class Infinization {
     this.ensureInitialized()
 
     return this.vmLock.runExclusive(config.vmId, async () => {
+      // Start the per-VM infinigpu device server BEFORE QEMU (which connects to
+      // its socket at boot). Reaped if creation fails so we never leak the host
+      // process or its broker admission ticket.
+      if (config.gpu) {
+        await this.startInfinigpuServer(config.vmId, config.gpu)
+      }
       const lifecycle = this.createLifecycle()
-      const result = await lifecycle.create(config)
+      let result: VMCreateResult
+      try {
+        result = await lifecycle.create(config)
+      } catch (err) {
+        await this.reapInfinigpuServer(config.vmId)
+        throw err
+      }
 
       // Track the VM
       this.trackVM(result.vmId, {
@@ -363,8 +385,19 @@ export class Infinization {
     this.ensureInitialized()
 
     return this.vmLock.runExclusive(vmId, async () => {
+      // Re-attach the GPU on every start (start reconstructs config from the DB,
+      // which has no gpu field — the backend threads department policy here).
+      if (config?.gpu) {
+        await this.startInfinigpuServer(vmId, config.gpu)
+      }
       const lifecycle = this.createLifecycle()
-      const result = await lifecycle.start(vmId, config)
+      let result: VMOperationResult
+      try {
+        result = await lifecycle.start(vmId, config)
+      } catch (err) {
+        await this.reapInfinigpuServer(vmId)
+        throw err
+      }
 
       if (result.success) {
         // Get internalName from DB for tracking
@@ -375,6 +408,9 @@ export class Infinization {
           createdAt: new Date(),
           internalName: internalName ?? vmId
         })
+      } else {
+        // Clean (non-throwing) start failure — don't leak the device server.
+        await this.reapInfinigpuServer(vmId)
       }
 
       return result
@@ -397,6 +433,7 @@ export class Infinization {
 
       if (result.success) {
         this.untrackVM(vmId)
+        await this.reapInfinigpuServer(vmId)
       }
 
       return result
@@ -424,6 +461,7 @@ export class Infinization {
 
       if (result.success) {
         this.untrackVM(vmId)
+        await this.reapInfinigpuServer(vmId)
       }
 
       return result
@@ -789,5 +827,41 @@ export class Infinization {
   private untrackVM (vmId: string): void {
     this.activeVMs.delete(vmId)
     this.debug.log(`Untracking VM: ${vmId}`)
+  }
+
+  /**
+   * Start (or restart) the infinigpu device server for a GPU VM and stamp the
+   * derived socket path onto `gpu` so buildQemuCommand + QEMU use it. Idempotent:
+   * reaps any prior server for this vmId first. Must run inside vmLock.
+   */
+  private async startInfinigpuServer (vmId: string, gpu: InfinigpuVmOptions): Promise<void> {
+    await this.reapInfinigpuServer(vmId)
+    const socketPath = path.join(this.qmpSocketDir, `${vmId}.gpu.sock`)
+    gpu.socketPath = socketPath
+    const server = new InfinigpuDeviceServer({
+      socketPath,
+      vmId,
+      pixelPort: gpu.pixelPort,
+      log: (_level, message) => this.debug.log(`[infinigpu ${vmId}] ${message}`)
+    })
+    await server.start()
+    this.infinigpuServers.set(vmId, server)
+    this.debug.log(`infinigpu device server started for VM ${vmId} (${socketPath})`)
+  }
+
+  /**
+   * Stop and forget the infinigpu device server for a VM (frees its broker
+   * admission ticket + host process). Idempotent / safe when none exists.
+   */
+  private async reapInfinigpuServer (vmId: string): Promise<void> {
+    const server = this.infinigpuServers.get(vmId)
+    if (!server) return
+    this.infinigpuServers.delete(vmId)
+    try {
+      await server.stop()
+      this.debug.log(`infinigpu device server reaped for VM ${vmId}`)
+    } catch (err) {
+      this.debug.log(`infinigpu device server reap for VM ${vmId} errored: ${(err as Error).message}`)
+    }
   }
 }

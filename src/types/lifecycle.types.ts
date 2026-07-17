@@ -139,6 +139,13 @@ export interface VMCreateConfig {
   gpuPciAddress?: string
   /** GPU ROM file path (optional) */
   gpuRomfile?: string
+  /**
+   * Opt-in infinigpu virtual GPU (docs/INTEGRATION.md §1/§2). When set, the VM gets
+   * a vfio-user display device backed by a per-VM `infinigpu-device` server and the
+   * SPICE/VNC console is skipped (infiniPixel is the remote display). The facade
+   * fills in `socketPath` after it starts the server.
+   */
+  gpu?: InfinigpuVmOptions
   /** QEMU machine type (e.g., 'q35', 'pc') - defaults to 'q35' */
   machineType?: string
   /** CPU model (e.g., 'host', 'qemu64') - defaults to 'host' */
@@ -452,6 +459,30 @@ export interface VMStartConfig {
    * with the host (e.g. nested/rootless containers that SIGSYS a sandboxed syscall).
    */
   disableSandbox?: boolean
+  /**
+   * Opt-in infinigpu virtual GPU for this start. Mirrors VMCreateConfig.gpu so a
+   * GPU VM re-attaches its device on every start (the reconstructed config is
+   * DB-derived and would otherwise drop it). The backend threads department policy
+   * here on every start; the facade fills in `socketPath`.
+   */
+  gpu?: InfinigpuVmOptions
+}
+
+/**
+ * Opt-in infinigpu virtual-GPU options threaded through the VM lifecycle.
+ */
+export interface InfinigpuVmOptions {
+  /**
+   * Host UNIX socket the vfio-user device server listens on and QEMU connects to.
+   * Derived + set by the Infinization facade (`${qmpSocketDir}/<vmId>.gpu.sock`);
+   * callers leave it undefined.
+   */
+  socketPath?: string
+  /**
+   * infiniPixel WebSocket port for this VM's remote-display stream. Omit to leave
+   * streaming disabled (the device server still renders; nothing is exposed).
+   */
+  pixelPort?: number
 }
 
 /**
