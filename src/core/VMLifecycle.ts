@@ -2769,12 +2769,13 @@ export class VMLifecycle {
   ): QemuCommandBuilder {
     const builder = new QemuCommandBuilder()
 
-    // Optional host override for the QEMU binary. infinigpu GPU VMs need a QEMU
-    // built with the upstream vfio-user-pci client (>= 10.1.1); point this at it
-    // host-wide (that QEMU is a superset, so non-GPU VMs run on it identically).
-    // Default keeps `qemu-system-x86_64` on PATH — unset = current behavior.
+    // Optional host override for the QEMU binary — applied ONLY to infinigpu GPU
+    // VMs (config.gpu). GPU VMs need a QEMU built with the upstream vfio-user-pci
+    // client (>= 10.1.1); non-GPU VMs deliberately keep the stock
+    // `qemu-system-x86_64` so a vfio-user QEMU that is absent or ABI-incompatible
+    // with this host/runtime can never break the existing (non-GPU) fleet.
     const qemuBinaryOverride = process.env.INFINIZATION_QEMU_BINARY
-    if (qemuBinaryOverride && qemuBinaryOverride.trim() !== '') {
+    if (config.gpu?.socketPath && qemuBinaryOverride && qemuBinaryOverride.trim() !== '') {
       builder.setBinary(qemuBinaryOverride.trim())
     }
 
