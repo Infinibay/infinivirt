@@ -24,11 +24,30 @@ export interface InfinigpuDeviceServerOptions {
   log?: (level: 'info' | 'warn' | 'error', message: string) => void
 }
 
+/** On-disk sidecar written next to the socket so a RESTARTED backend can re-adopt a still-running
+ *  device server (see {@link InfinigpuDeviceServer.adopt}). QEMU is `-daemonize`d and the device is
+ *  spawned detached, so both survive a backend restart; this file is the only thing the new backend
+ *  needs to find the survivor. */
+interface InfinigpuDeviceMeta {
+  pid: number
+  vmId: string
+  socketPath: string
+  pixelPort?: number
+}
+
 /**
  * Manages the lifetime of one **`infinigpu-device`** vfio-user server process — one per GPU
  * VM. It is spawned **before** QEMU (QEMU connects to its socket at boot) and reaped on VM
  * stop, mirroring the QEMU / SPICE-proxy lifecycle. On stop the server drops its broker
  * admission ticket (freeing the VRAM commit + concurrency slot) and exits.
+ *
+ * **Survives a backend restart.** QEMU is `-daemonize`d (parented to init) and, because vfio-user's
+ * `SocketAddress` has no `reconnect=`, QEMU can NEVER reconnect to a fresh device server — so if the
+ * device died on restart, the guest's GPU would be gone until a full VM power-cycle. To avoid that we
+ * spawn the device **detached** (its own session) with stdio to a **log file** (not a pipe to the
+ * backend — a broken pipe would `panic!` the Rust `println!`/`env_logger` and kill it), and drop a
+ * {@link InfinigpuDeviceMeta} sidecar. A restarted backend calls {@link InfinigpuDeviceServer.adopt}
+ * to re-take ownership of the survivor (reap-by-pid) instead of orphaning it.
  *
  * **Opt-in and inert:** only instantiated for a VM whose department has GPU enabled — VMs
  * without GPU never construct one, so existing behavior is unchanged. See the infinigpu
@@ -36,6 +55,9 @@ export interface InfinigpuDeviceServerOptions {
  */
 export class InfinigpuDeviceServer {
   private process: ChildProcess | null = null
+  /** Set instead of {@link process} when this instance was re-adopted (see {@link adopt}) from a
+   *  device that a PRIOR backend spawned — we have its pid but not a ChildProcess handle. */
+  private adoptedPid: number | null = null
   private readonly binary: string
   private readonly socketPath: string
   private readonly vmId: string
@@ -60,12 +82,25 @@ export class InfinigpuDeviceServer {
     })
   }
 
+  /** Sidecar path — the survivor record a restarted backend re-adopts from. */
+  private get metaPath (): string {
+    return `${this.socketPath}.meta`
+  }
+
+  /** Device stdout/stderr go here (a file, never a pipe to the backend — see the class doc). */
+  private get logPath (): string {
+    return `${this.socketPath}.log`
+  }
+
   get pid (): number | null {
-    return this.process?.pid ?? null
+    return this.process?.pid ?? this.adoptedPid
   }
 
   get running (): boolean {
-    return this.process !== null && this.process.exitCode === null && !this.stopped
+    if (this.stopped) return false
+    if (this.process) return this.process.exitCode === null
+    if (this.adoptedPid != null) return isPidAlive(this.adoptedPid)
+    return false
   }
 
   /** The argv the server is spawned with (exposed for logging / tests). */
@@ -83,11 +118,51 @@ export class InfinigpuDeviceServer {
   }
 
   /**
+   * Re-adopt a device server that a PRIOR backend spawned and that is still running (its
+   * {@link InfinigpuDeviceMeta} sidecar exists and the pid is alive). Returns an instance that
+   * owns the survivor by pid — no new process is spawned, the guest's GPU keeps rendering
+   * uninterrupted. Returns `null` if there is no sidecar or the recorded pid is dead (the
+   * device is truly gone and cannot be transparently restored — the VM needs a power-cycle).
+   */
+  static adopt (
+    socketPath: string,
+    log?: (level: 'info' | 'warn' | 'error', message: string) => void
+  ): InfinigpuDeviceServer | null {
+    const metaPath = `${assertSafePath(socketPath, 'infinigpuSocketPath')}.meta`
+    let meta: InfinigpuDeviceMeta
+    try {
+      meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as InfinigpuDeviceMeta
+    } catch {
+      return null // no sidecar → nothing to adopt
+    }
+    if (!meta || typeof meta.pid !== 'number' || !isPidAlive(meta.pid)) {
+      // Stale sidecar for a dead device — clean it up so it doesn't mislead a later reconcile.
+      try { fs.rmSync(metaPath, { force: true }) } catch { /* best effort */ }
+      return null
+    }
+    const server = new InfinigpuDeviceServer({
+      socketPath,
+      vmId: meta.vmId ?? 'unknown',
+      pixelPort: meta.pixelPort,
+      log
+    })
+    server.adoptedPid = meta.pid
+    server.stopped = false
+    server.log('info', `re-adopted surviving device (pid ${meta.pid}) on ${socketPath}`)
+    return server
+  }
+
+  /** The infiniPixel port this device streams on (needed to rebuild the host broker ticket). */
+  get streamPixelPort (): number | undefined {
+    return this.pixelPort
+  }
+
+  /**
    * Spawn the device server and resolve once its socket is accepting (QEMU needs it to
    * exist before it connects). Rejects on early process exit, spawn error, or timeout.
    */
   async start (timeoutMs = 5000): Promise<void> {
-    if (this.process) {
+    if (this.process || this.adoptedPid != null) {
       throw new Error(`infinigpu-device for VM ${this.vmId} already started`)
     }
     // A stale socket from a prior run would make the server refuse to bind.
@@ -97,16 +172,32 @@ export class InfinigpuDeviceServer {
       /* best effort */
     }
 
-    const child = spawn(this.binary, this.buildArgs(), {
-      detached: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: this.buildEnv()
-    })
+    // stdio → a log file, NOT a pipe: if the backend dies, a piped stdout closes and the Rust
+    // device panics on its next `println!`. A file fd stays valid regardless of the parent, so the
+    // detached device keeps serving QEMU across a backend restart. Truncate per spawn.
+    let logFd: number
+    try {
+      logFd = fs.openSync(this.logPath, 'w')
+    } catch {
+      // Fall back to discarding output rather than failing the spawn on a log-open error.
+      logFd = fs.openSync('/dev/null', 'w')
+    }
+
+    let child: ChildProcess
+    try {
+      child = spawn(this.binary, this.buildArgs(), {
+        // Detached: own session/process-group, so a nodemon/process-group signal aimed at the
+        // backend does not reach it. QEMU is likewise -daemonize'd; the pair survives together.
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+        env: this.buildEnv()
+      })
+    } finally {
+      // The child inherited the fd; the parent no longer needs it.
+      try { fs.closeSync(logFd) } catch { /* best effort */ }
+    }
     this.process = child
     this.stopped = false
-
-    child.stdout?.on('data', (d) => this.log('info', d.toString().trimEnd()))
-    child.stderr?.on('data', (d) => this.log('info', d.toString().trimEnd()))
 
     return await new Promise<void>((resolve, reject) => {
       let settled = false
@@ -133,6 +224,9 @@ export class InfinigpuDeviceServer {
       const poll = setInterval(() => {
         if (fs.existsSync(this.socketPath)) {
           this.log('info', `serving on ${this.socketPath} (pid ${child.pid})`)
+          this.writeMeta(child.pid)
+          // Don't let this (now self-sufficient, detached) child keep the backend event loop alive.
+          child.unref()
           finish(resolve)
         }
       }, 100)
@@ -142,49 +236,104 @@ export class InfinigpuDeviceServer {
     })
   }
 
+  /** Persist the survivor record a restarted backend re-adopts from. Best-effort. */
+  private writeMeta (pid: number | undefined): void {
+    if (pid == null) return
+    const meta: InfinigpuDeviceMeta = { pid, vmId: this.vmId, socketPath: this.socketPath, pixelPort: this.pixelPort }
+    try {
+      fs.writeFileSync(this.metaPath, JSON.stringify(meta))
+    } catch (err) {
+      this.log('warn', `could not write device sidecar ${this.metaPath}: ${(err as Error).message}`)
+    }
+  }
+
   /**
    * Gracefully stop the server (SIGTERM → wait → SIGKILL). The server drops its admission
-   * ticket on exit. Safe to call more than once / when never started.
+   * ticket on exit. Safe to call more than once / when never started. Works whether this
+   * instance owns a ChildProcess (spawned here) or only a pid (re-adopted after a restart).
    */
   async stop (timeoutMs = 5000): Promise<void> {
-    const child = this.process
-    if (!child || this.stopped) {
-      this.stopped = true
+    if (this.stopped) {
+      this.cleanupFiles()
       return
     }
     this.stopped = true
 
-    await new Promise<void>((resolve) => {
-      let done = false
-      const finish = () => {
-        if (done) return
-        done = true
-        clearTimeout(killTimer)
-        this.process = null
-        resolve()
-      }
-      child.once('exit', finish)
-      try {
-        child.kill('SIGTERM')
-      } catch {
-        finish()
-        return
-      }
-      const killTimer = setTimeout(() => {
-        this.log('warn', 'did not exit on SIGTERM; sending SIGKILL')
-        try {
-          child.kill('SIGKILL')
-        } catch {
-          /* already gone */
+    const child = this.process
+    if (child) {
+      await new Promise<void>((resolve) => {
+        let done = false
+        const finish = () => {
+          if (done) return
+          done = true
+          clearTimeout(killTimer)
+          this.process = null
+          resolve()
         }
-      }, timeoutMs)
-    })
+        child.once('exit', finish)
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          finish()
+          return
+        }
+        const killTimer = setTimeout(() => {
+          this.log('warn', 'did not exit on SIGTERM; sending SIGKILL')
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            /* already gone */
+          }
+        }, timeoutMs)
+      })
+    } else if (this.adoptedPid != null) {
+      // Re-adopted survivor: we have only a pid, so signal + poll for exit.
+      await this.stopByPid(this.adoptedPid, timeoutMs)
+      this.adoptedPid = null
+    }
 
-    // Clean up the socket so a later VM re-using the path can bind.
-    try {
-      fs.rmSync(this.socketPath, { force: true })
-    } catch {
-      /* best effort */
+    this.cleanupFiles()
+  }
+
+  /** SIGTERM a re-adopted device by pid, escalate to SIGKILL, poll until gone. */
+  private async stopByPid (pid: number, timeoutMs: number): Promise<void> {
+    const trySignal = (sig: NodeJS.Signals): boolean => {
+      try { process.kill(pid, sig); return true } catch { return false }
+    }
+    if (!trySignal('SIGTERM')) return // already gone
+    const deadline = Date.now() + timeoutMs
+    let killed = false
+    while (Date.now() < deadline) {
+      if (!isPidAlive(pid)) return
+      await sleep(100)
+      if (!killed && Date.now() > deadline - Math.floor(timeoutMs / 2)) {
+        this.log('warn', `adopted device (pid ${pid}) did not exit on SIGTERM; sending SIGKILL`)
+        trySignal('SIGKILL')
+        killed = true
+      }
+    }
+    if (isPidAlive(pid)) trySignal('SIGKILL')
+  }
+
+  /** Remove the socket, sidecar and log so a later VM re-using the path can bind cleanly. */
+  private cleanupFiles (): void {
+    for (const p of [this.socketPath, this.metaPath, this.logPath]) {
+      try { fs.rmSync(p, { force: true }) } catch { /* best effort */ }
     }
   }
+}
+
+/** `kill(pid, 0)` — true iff the process exists and we may signal it. */
+function isPidAlive (pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    // EPERM = exists but not ours (still "alive"); ESRCH = gone.
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function sleep (ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }

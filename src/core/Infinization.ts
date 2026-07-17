@@ -663,6 +663,34 @@ export class Infinization {
   }
 
   /**
+   * Re-adopt a GPU VM's **surviving** infinigpu device server after a backend restart.
+   *
+   * The device is spawned detached (its own session, stdio to a file) and QEMU is
+   * `-daemonize`d, so both keep running when the backend restarts — the guest's GPU never
+   * drops. This re-takes ownership of the survivor (so a later stop reaps it) and returns the
+   * infiniPixel port it is streaming on, which the caller uses to rebuild the host broker
+   * ticket + console relay. Returns `undefined` when the VM has no GPU device or its device is
+   * truly gone (no sidecar / dead pid) — nothing to re-adopt, and the display can only be
+   * restored by a VM power-cycle. Idempotent: an already-tracked server just returns its port.
+   */
+  public async reattachInfinigpuServer (vmId: string): Promise<number | undefined> {
+    this.ensureInitialized()
+    const existing = this.infinigpuServers.get(vmId)
+    if (existing) return existing.streamPixelPort
+
+    const socketPath = path.join(this.qmpSocketDir, `${vmId}.gpu.sock`)
+    const server = InfinigpuDeviceServer.adopt(
+      socketPath,
+      (_level, message) => this.debug.log(`[infinigpu ${vmId}] ${message}`)
+    )
+    if (!server) return undefined
+
+    this.infinigpuServers.set(vmId, server)
+    this.debug.log(`infinigpu device server re-adopted for VM ${vmId} (pixelPort ${server.streamPixelPort ?? '?'})`)
+    return server.streamPixelPort
+  }
+
+  /**
    * Gets the active database facade (a PrismaAdapter on the master, or an
    * injected remote adapter on a compute-node agent).
    */
