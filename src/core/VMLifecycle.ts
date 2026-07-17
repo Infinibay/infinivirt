@@ -597,7 +597,14 @@ export class VMLifecycle {
       await qmpClient.connect()
 
       // 9a. Deliver the display password over QMP (never on the QEMU command line).
-      await this.applyDisplayPassword(qmpClient, config.displayType, config.displayPassword)
+      // SKIP for infinigpu VMs: they run headless (no SPICE/VNC server — see the addSpice
+      // gating), so `set_password` fails QMP with "SPICE is not in use (DeviceNotActive)"
+      // and the fail-closed handler would abort an otherwise-healthy GPU VM.
+      if (!config.gpu?.socketPath) {
+        await this.applyDisplayPassword(qmpClient, config.displayType, config.displayPassword)
+      } else {
+        this.debug.log('info', 'infinigpu VM: skipping display-password QMP step (headless, no SPICE/VNC server)')
+      }
 
       // 9. Verify VM status via QMP
       const status = await qmpClient.queryStatus()
@@ -1291,7 +1298,13 @@ export class VMLifecycle {
       await qmpClient.connect()
 
       // 15a. Deliver the display password over QMP (never on the QEMU command line).
-      await this.applyDisplayPassword(qmpClient, displayProtocol, displayPassword)
+      // SKIP for infinigpu VMs (headless, no SPICE/VNC server) — same reason as create:
+      // set_password would fail QMP with "SPICE is not in use" and abort a healthy GPU VM.
+      if (!config?.gpu?.socketPath) {
+        await this.applyDisplayPassword(qmpClient, displayProtocol, displayPassword)
+      } else {
+        this.debug.log('info', 'infinigpu VM: skipping display-password QMP step on start (headless)')
+      }
 
       // 16. Verify VM status via QMP
       const status = await qmpClient.queryStatus()
