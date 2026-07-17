@@ -155,6 +155,21 @@ export interface MachineOptions {
 }
 
 /**
+ * Options for the infinigpu virtual GPU (a vfio-user PCI device served out-of-process by
+ * the `infinigpu-device` server). Opt-in per VM — attached only when a department enables
+ * GPU. See the infinigpu repo's docs/INTEGRATION.md.
+ */
+export interface InfinigpuDeviceOptions {
+  /** UNIX socket the infinigpu-device server listens on (QEMU connects to it at boot). */
+  socketPath: string
+  /**
+   * Guest RAM size in **bytes**. The device mmaps guest RAM zero-copy through a
+   * `memory-backend-memfd`, so the machine's memory backend size must match `-m`.
+   */
+  guestRamBytes: number
+}
+
+/**
  * Options for disk configuration
  */
 export interface DiskOptions {

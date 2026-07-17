@@ -8,6 +8,7 @@ import {
   VncOptions,
   BootDevice,
   QemuProcessOptions,
+  InfinigpuDeviceOptions,
   validatePciAddress
 } from '../types/qemu.types'
 import { SpiceConfig } from '../display/SpiceConfig'
@@ -471,6 +472,70 @@ export class QemuCommandBuilder {
       deviceArg += `,romfile=${safeRomfile}`
     }
     this.args.push('-device', deviceArg)
+    return this
+  }
+
+  /**
+   * Attach an **infinigpu** virtual GPU: a vfio-user PCI device served out-of-process by
+   * the `infinigpu-device` server (started separately, before QEMU). Unlike
+   * {@link addGpuPassthrough} (which dedicates a whole physical GPU to one VM), infinigpu
+   * lets many VMs share one GPU under the host broker — so this is the density path.
+   *
+   * **Opt-in only** — call this exclusively when a department has GPU enabled; existing
+   * VMs that don't call it are completely unaffected. See the infinigpu repo's
+   * `docs/INTEGRATION.md`.
+   *
+   * It (1) adds a `memory-backend-memfd` so the device can mmap guest RAM zero-copy
+   * (`share=on` is mandatory), (2) makes the machine consume that backend, (3) forces
+   * `-vga none` so our device is the guest's only display (fbcon binds fb0 to us), and
+   * (4) adds the vfio-user device in **JSON** form.
+   *
+   * @remarks
+   * - **`x-no-posted-writes=true` is mandatory**: the `vfio_user` v0.1.3 server always
+   *   replies to `REGION_WRITE`, but QEMU posts MMIO writes by default → protocol desync
+   *   the moment a guest driver writes a BAR.
+   * - `x-pci-class-code=229376` = `0x038000` (Display-Other).
+   * - Requires a QEMU built with the upstream `vfio-user-pci` client (QEMU ≥ 10.1).
+   * - Don't combine with SPICE/VNC `qxl`/`std` VGA on the same VM — infinigpu is the display.
+   */
+  addInfinigpuDevice (options: InfinigpuDeviceOptions): this {
+    const socket = assertSafePath(options.socketPath, 'infinigpuSocketPath')
+    const size = Math.floor(options.guestRamBytes)
+    if (!Number.isFinite(size) || size <= 0) {
+      throw new Error('addInfinigpuDevice: guestRamBytes must be a positive integer (bytes)')
+    }
+
+    // 1. memfd-backed guest RAM the device can mmap zero-copy (share=on is mandatory).
+    this.args.push('-object', `memory-backend-memfd,id=mem0,share=on,size=${size}`)
+
+    // 2. the machine must consume that backend; augment the existing -machine (added by
+    //    setMachine) or add a q35 one if the caller hasn't set the machine yet.
+    const mi = this.args.indexOf('-machine')
+    if (mi >= 0 && mi + 1 < this.args.length) {
+      if (!/(^|,)memory-backend=/.test(this.args[mi + 1])) {
+        this.args[mi + 1] += ',memory-backend=mem0'
+      }
+    } else {
+      this.args.push('-machine', 'q35,accel=kvm,memory-backend=mem0')
+    }
+
+    // 3. no default VGA, so our device is the guest's only display.
+    const vi = this.args.indexOf('-vga')
+    if (vi >= 0 && vi + 1 < this.args.length) {
+      this.args[vi + 1] = 'none'
+    } else {
+      this.args.push('-vga', 'none')
+    }
+
+    // 4. the vfio-user device — JSON form (socket is a SocketAddress union, so the flat
+    //    comma form is rejected). See @remarks for why x-no-posted-writes is mandatory.
+    const device = JSON.stringify({
+      driver: 'vfio-user-pci',
+      socket: { path: socket, type: 'unix' },
+      'x-pci-class-code': 229376,
+      'x-no-posted-writes': true
+    })
+    this.args.push('-device', device)
     return this
   }
 

@@ -32,6 +32,38 @@ describe('QemuCommandBuilder — argument-injection hardening', () => {
     })
   })
 
+  describe('addInfinigpuDevice', () => {
+    it('adds a share=on memfd backend, makes the machine consume it, forces -vga none, and emits the JSON vfio-user device', () => {
+      b.setMachine('q35', { accel: 'kvm' }).addInfinigpuDevice({ socketPath: '/run/infinization/sockets/vm1.gpu.sock', guestRamBytes: 4 * 1024 * 1024 * 1024 })
+      const args = b.buildCommand().args
+      const joined = args.join(' ')
+      // memfd backend, sized in bytes, shared.
+      expect(joined).toContain('memory-backend-memfd,id=mem0,share=on,size=4294967296')
+      // the existing -machine was augmented to consume the backend (not duplicated).
+      const machineIdx = args.indexOf('-machine')
+      expect(args[machineIdx + 1]).toContain('memory-backend=mem0')
+      expect(args.filter(a => a === '-machine').length).toBe(1)
+      // our device is the only display.
+      const vgaIdx = args.indexOf('-vga')
+      expect(args[vgaIdx + 1]).toBe('none')
+      // JSON device with the mandatory flags.
+      const dev = JSON.parse(args[args.lastIndexOf('-device') + 1])
+      expect(dev.driver).toBe('vfio-user-pci')
+      expect(dev.socket).toEqual({ path: '/run/infinization/sockets/vm1.gpu.sock', type: 'unix' })
+      expect(dev['x-no-posted-writes']).toBe(true)
+      expect(dev['x-pci-class-code']).toBe(229376)
+    })
+
+    it('rejects a socket path that would splice shell/arg metacharacters', () => {
+      expect(() => b.addInfinigpuDevice({ socketPath: '/run/x.sock,readonly=on', guestRamBytes: 1024 }))
+        .toThrow()
+    })
+
+    it('rejects a non-positive guest RAM size', () => {
+      expect(() => b.addInfinigpuDevice({ socketPath: '/run/x.sock', guestRamBytes: 0 })).toThrow()
+    })
+  })
+
   describe('setCpu / setProcessOptions / addNetwork', () => {
     it('rejects a -cpu model that splices features', () => {
       expect(() => b.setCpu('host,enforce=off')).toThrow(QemuArgValidationError)
