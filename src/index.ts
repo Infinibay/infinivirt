@@ -1,6 +1,7 @@
 // Core classes
 export { QemuCommandBuilder, QemuCommand, QemuCommandWithPinning } from './core/QemuCommandBuilder'
 export { QemuProcess } from './core/QemuProcess'
+export { InfinigpuDeviceServer, InfinigpuDeviceServerOptions } from './core/InfinigpuDeviceServer'
 export { QMPClient } from './core/QMPClient'
 export { VMLifecycle } from './core/VMLifecycle'
 export { Infinization } from './core/Infinization'
