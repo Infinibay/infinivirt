@@ -108,11 +108,46 @@ export class InfinigpuDeviceServer {
     return ['--socket', this.socketPath, '--vm-id', this.vmId]
   }
 
+  /**
+   * Resolve the actual launch command. Fix E (opt-in, env INFINIGPU_NUMA_NODE=<node>): wrap the
+   * device server in `numactl --cpunodebind=<node> --membind=<node>` so its CPU + memory (the
+   * Vulkan replay + the mmap'd guest memfd it touches every submit) stay local to the GPU's NUMA
+   * node on a multi-socket host. `numactl` exec's the target, so the tracked pid is still the
+   * device. Unset (or an invalid value) → spawn the binary directly, unchanged. Requires `numactl`
+   * on PATH when enabled.
+   */
+  private launchTarget (): { cmd: string, args: string[] } {
+    const raw = process.env.INFINIGPU_NUMA_NODE
+    if (raw !== undefined && /^\d+$/.test(raw.trim())) {
+      const node = raw.trim()
+      return {
+        cmd: 'numactl',
+        args: [`--cpunodebind=${node}`, `--membind=${node}`, '--', this.binary, ...this.buildArgs()]
+      }
+    }
+    return { cmd: this.binary, args: this.buildArgs() }
+  }
+
   /** The child environment. `INFINIGPU_PIXEL_PORT` enables this VM's infiniPixel stream. */
   buildEnv (): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env, ...this.extraEnv }
     if (this.pixelPort !== undefined) {
       env.INFINIGPU_PIXEL_PORT = String(this.pixelPort)
+    }
+    // Advertise the off-primary cursor plane (CAP_CURSOR_PLANE) by default so the guest
+    // builds a DRM cursor plane and emits CURSOR_UPDATE sidebands instead of baking the
+    // pointer into the primary scanout. Baked-in cursors leak stale sprites through the
+    // damage-forwarding path — a cursor *trail* on the viewer — because the "restore the
+    // pixels under the old pointer" damage is not reliably captured. With the plane on, the
+    // device forwards the sprite/position to the viewer, which draws the cursor client-side
+    // (also killing cursor lag). The guest self-gates (kernel >= 6.6 + reads the cap), so an
+    // older guest simply ignores it and keeps the SW cursor. The device only checks the var's
+    // presence, so translate an explicit falsey value into *unsetting* it (opt-out switch).
+    const cur = process.env.INFINIGPU_CURSOR_PLANE
+    if (cur !== undefined && /^(0|false|off|no)$/i.test(cur)) {
+      delete env.INFINIGPU_CURSOR_PLANE
+    } else {
+      env.INFINIGPU_CURSOR_PLANE = '1'
     }
     return env
   }
@@ -185,7 +220,8 @@ export class InfinigpuDeviceServer {
 
     let child: ChildProcess
     try {
-      child = spawn(this.binary, this.buildArgs(), {
+      const { cmd, args } = this.launchTarget()
+      child = spawn(cmd, args, {
         // Detached: own session/process-group, so a nodemon/process-group signal aimed at the
         // backend does not reach it. QEMU is likewise -daemonize'd; the pair survives together.
         detached: true,

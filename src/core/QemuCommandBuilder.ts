@@ -506,7 +506,17 @@ export class QemuCommandBuilder {
     }
 
     // 1. memfd-backed guest RAM the device can mmap zero-copy (share=on is mandatory).
-    this.args.push('-object', `memory-backend-memfd,id=mem0,share=on,size=${size}`)
+    //    Fix E (opt-in, env INFINIGPU_NUMA_NODE=<node>): pin the guest RAM to the GPU's NUMA node
+    //    (host-nodes + policy=bind) and pre-fault it (prealloc=on) so the per-submit command/frame
+    //    DMA stays node-local and never pays a first-touch page fault. Unset → unchanged behavior.
+    //    (Set it to the node of the GPU this VM uses; a proper per-VM mapping is future work.)
+    let memfd = `memory-backend-memfd,id=mem0,share=on,size=${size}`
+    const rawNumaNode = process.env.INFINIGPU_NUMA_NODE
+    if (rawNumaNode !== undefined && /^\d+$/.test(rawNumaNode.trim())) {
+      const node = parseInt(rawNumaNode.trim(), 10)
+      memfd += `,prealloc=on,host-nodes=${node},policy=bind`
+    }
+    this.args.push('-object', memfd)
 
     // 2. the machine must consume that backend; augment the existing -machine (added by
     //    setMachine) or add a q35 one if the caller hasn't set the machine yet.
